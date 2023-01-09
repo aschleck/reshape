@@ -249,6 +249,22 @@ primary_key = ["user_id"]
 	values = { user_id = "id", user_email = "email" }
 ```
 
+_Example: create `users` with a partition*
+
+```toml
+[[actions]]
+type = "create_table"
+name = "users"
+primary_key = ["id"]
+
+	[[actions.columns]]
+	name = "id"
+	type = "INTEGER"
+
+	[actions.partition_by]
+	hash = ["id"] # or list = ["id"] or range = ["id"]
+```
+
 #### Rename table
 
 The `rename_table` action will change the name of an existing table.
@@ -552,6 +568,19 @@ table = "products"
 
 	# One of: btree (default), hash, gist, spgist, gin, brin
 	type = "gin"
+```
+
+*Example: add a non-concurrent index
+
+```toml
+[[actions]]
+type = "add_index"
+table = "products"
+
+	[actions.index]
+	name = "data_idx"
+	columns = ["data"]
+	concurrently = false
 ```
 
 #### Remove index
