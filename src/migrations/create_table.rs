@@ -18,6 +18,7 @@ pub struct CreateTable {
     pub name: String,
     pub columns: Vec<Column>,
     pub primary_key: Option<Vec<String>>,
+    pub partition_by: Option<PartitionBy>,
 
     #[serde(default)]
     pub foreign_keys: Vec<ForeignKey>,
@@ -28,6 +29,13 @@ pub struct CreateTable {
     pub comment: Option<String>,
 
     pub up: Option<Transformation>,
+}
+
+#[derive(Serialize, Deserialize, Debug)]
+pub struct PartitionBy {
+    pub hash: Option<Vec<String>>,
+    pub list: Option<Vec<String>>,
+    pub range: Option<Vec<String>>,
 }
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -142,11 +150,36 @@ impl Action for CreateTable {
             definition_rows.push(check.definition());
         }
 
+        let mut partitioning = "".to_string();
+        if let Some(partition_by) = &self.partition_by {
+            let method: &str;
+            let columns: &Vec<String>;
+            if let Some(hash) = &partition_by.hash {
+                method = "HASH";
+                columns = hash;
+            } else if let Some(list) = &partition_by.list {
+                method = "LIST";
+                columns = list;
+            } else if let Some(range) = &partition_by.range {
+                method = "RANGE";
+                columns = range;
+            } else {
+                return Err(anyhow::anyhow!("No partition scheme specified for table '{}'", self.name));
+            }
+            let joined: String = columns.iter()
+                // Add quotes around all column names
+                .map(|col| format!("\"{}\"", col))
+                .collect::<Vec<String>>()
+                .join(", ");
+            partitioning = format!("PARTITION BY {} ({})", method, joined);
+        }
+
         let query = &format!(
             r#"
             CREATE TABLE "{name}" (
                 {definition}
             )
+            {partitioning}
             "#,
             name = self.name,
             definition = definition_rows.join(",\n"),
