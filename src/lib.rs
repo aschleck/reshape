@@ -512,7 +512,7 @@ fn create_view_for_table(db: &mut impl Conn, table: &Table, schema: &str) -> any
     db.run(&format!(
         r#"
         CREATE OR REPLACE VIEW {schema}."{view_name}" AS
-            SELECT {columns}
+            SELECT {columns}, tableoid, xmin, cmin, xmax, cmax, ctid
             FROM "{table_name}"
         "#,
         schema = schema,
