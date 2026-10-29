@@ -1276,3 +1276,65 @@ fn add_column_in_migration_with_long_name() {
 
     test.run();
 }
+
+#[test]
+fn add_column_with_composite_primary_key() {
+    let mut test = Test::new("Add column with composite primary key");
+
+    test.first_migration(
+        r#"
+        name = "create_items_table"
+
+        [[actions]]
+        type = "create_table"
+        name = "items"
+        primary_key = ["owner_id", "id"]
+
+            [[actions.columns]]
+            name = "owner_id"
+            type = "INTEGER"
+
+            [[actions.columns]]
+            name = "id"
+            type = "INTEGER"
+        "#,
+    );
+
+    test.second_migration(
+        r#"
+        name = "add_doubled_column"
+
+        [[actions]]
+        type = "add_column"
+        table = "items"
+
+        up = "id * 2"
+
+            [actions.column]
+            name = "doubled"
+            type = "INTEGER"
+            nullable = false
+        "#,
+    );
+
+    test.after_first(|db| {
+        // More rows than one backfill batch holds, so that a later batch starts from a cursor
+        db.simple_query(
+            "INSERT INTO items (owner_id, id) SELECT i % 3, i FROM generate_series(1, 2500) i",
+        )
+        .unwrap();
+    });
+
+    test.intermediate(|_, new_db| {
+        let missing: i64 = new_db
+            .query_one(
+                "SELECT COUNT(*) FROM items WHERE doubled IS DISTINCT FROM id * 2",
+                &[],
+            )
+            .unwrap()
+            .get(0);
+        assert_eq!(0, missing);
+    });
+
+    test.run();
+}

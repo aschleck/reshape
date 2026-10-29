@@ -1,5 +1,5 @@
 use anyhow::{anyhow, Context};
-use postgres::types::{FromSql, ToSql};
+use postgres::types::ToSql;
 use serde::{Deserialize, Serialize};
 
 use crate::{db::Conn, schema::Table};
@@ -104,49 +104,6 @@ impl Check {
     }
 }
 
-#[derive(Debug)]
-struct PostgresRawValue {
-    bytes: Vec<u8>,
-}
-
-impl<'a> FromSql<'a> for PostgresRawValue {
-    fn from_sql(
-        _ty: &postgres::types::Type,
-        raw: &'a [u8],
-    ) -> Result<Self, Box<dyn std::error::Error + Sync + Send>> {
-        Ok(PostgresRawValue {
-            bytes: raw.to_vec(),
-        })
-    }
-
-    fn accepts(_ty: &postgres::types::Type) -> bool {
-        true
-    }
-}
-
-impl ToSql for PostgresRawValue {
-    fn to_sql(
-        &self,
-        _ty: &postgres::types::Type,
-        out: &mut postgres::types::private::BytesMut,
-    ) -> Result<postgres::types::IsNull, Box<dyn std::error::Error + Sync + Send>>
-    where
-        Self: Sized,
-    {
-        out.extend_from_slice(&self.bytes);
-        Ok(postgres::types::IsNull::No)
-    }
-
-    fn accepts(_ty: &postgres::types::Type) -> bool
-    where
-        Self: Sized,
-    {
-        true
-    }
-
-    postgres::types::to_sql_checked!();
-}
-
 pub fn batch_touch_rows(
     db: &mut dyn Conn,
     table: &str,
@@ -154,7 +111,9 @@ pub fn batch_touch_rows(
 ) -> anyhow::Result<()> {
     const BATCH_SIZE: u16 = 1000;
 
-    let mut cursor: Option<PostgresRawValue> = None;
+    // The last row touched, as JSON of its primary key. A key of several columns has no type a
+    // parameter can carry, so we rebuild the row from JSON instead.
+    let mut cursor: Option<String> = None;
 
     let primary_key = get_primary_key_columns_for_table(db, table)?;
 
@@ -177,8 +136,14 @@ pub fn batch_touch_rows(
             params.push(cursor);
 
             format!(
-                "WHERE ({primary_key_columns}) > $1",
-                primary_key_columns = primary_key_columns
+                r#"
+                WHERE ({primary_key_columns}) > (
+                    SELECT {primary_key_columns}
+                    FROM json_populate_record(NULL::public."{table}", $1::text::json)
+                )
+                "#,
+                primary_key_columns = primary_key_columns,
+                table = table,
             )
         } else {
             "".to_string()
@@ -199,8 +164,9 @@ pub fn batch_touch_rows(
                 WHERE {primary_key_where}
                 RETURNING {returning_columns}
             )
-            SELECT LAST_VALUE(({primary_key_columns})) OVER () AS last_value
-            FROM update
+            SELECT to_json(updated)::text AS last_value
+            FROM update AS updated
+            ORDER BY {primary_key_columns} DESC
             LIMIT 1
             "#,
             batch_size = BATCH_SIZE,
