@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use crate::{
     migrations::{quote_string_literal, validate_against_schema, Migration, MigrationContext},
@@ -273,8 +273,20 @@ fn migrate(
         println!("Migrating '{}':", migration.name);
         last_migration_index = migration_index;
 
+        // Backfills left by consecutive actions that defer them, run together so that each
+        // table is touched once
+        let mut deferred_touches: Vec<(String, String)> = Vec::new();
+
         for (action_index, action) in migration.actions.iter().enumerate() {
             last_action_index = action_index;
+
+            // An action which doesn't defer its backfill may depend on the deferred ones
+            if !action.defers_touches() {
+                result = touch_deferred(db, &mut deferred_touches);
+                if result.is_err() {
+                    break 'outer;
+                }
+            }
 
             let description = action.describe();
             print!("  + {} ", description);
@@ -299,18 +311,24 @@ fn migrate(
                 break 'outer;
             }
 
-            let ctx = MigrationContext::new(migration_index, action_index);
+            let ctx = MigrationContext::deferring_touches(migration_index, action_index);
             result = action
                 .run(&ctx, db, &new_schema)
                 .with_context(|| format!("failed to {}", description));
 
             if result.is_ok() {
                 action.update_schema(&ctx, &mut new_schema);
+                deferred_touches.extend(ctx.take_deferred_touches());
                 println!("{}", "done".green());
             } else {
                 println!("{}", "failed".red());
                 break 'outer;
             }
+        }
+
+        result = touch_deferred(db, &mut deferred_touches);
+        if result.is_err() {
+            break 'outer;
         }
 
         println!();
@@ -352,6 +370,28 @@ fn migrate(
     println!(
         "  - Run 'reshape migration complete' once your application has been updated and the previous schema is no longer in use"
     );
+    Ok(())
+}
+
+// Touches each table in `touches` once, with the column the first action to defer it chose
+fn touch_deferred(db: &mut DbConn, touches: &mut Vec<(String, String)>) -> anyhow::Result<()> {
+    let mut touched = HashSet::new();
+    for (table, column) in touches.drain(..) {
+        if !touched.insert(table.clone()) {
+            continue;
+        }
+
+        print!("  + Backfilling \"{}\" ", table);
+        let result = migrations::common::batch_touch_rows(db, &table, Some(&column))
+            .with_context(|| format!("failed to backfill \"{}\"", table));
+        if result.is_ok() {
+            println!("{}", "done".green());
+        } else {
+            println!("{}", "failed".red());
+            return result;
+        }
+    }
+
     Ok(())
 }
 

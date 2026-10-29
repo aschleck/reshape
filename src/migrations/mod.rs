@@ -4,6 +4,7 @@ use crate::{
 };
 use core::fmt::Debug;
 use serde::{Deserialize, Serialize};
+use std::cell::RefCell;
 
 /// A field of an action which holds user-provided SQL
 #[derive(Debug, Clone)]
@@ -438,6 +439,9 @@ impl Clone for Migration {
 pub struct MigrationContext {
     migration_index: usize,
     action_index: usize,
+    // The tables left for the caller to touch, with the column to set on each, or None to
+    // touch them right away
+    deferred_touches: Option<RefCell<Vec<(String, String)>>>,
 }
 
 impl MigrationContext {
@@ -445,7 +449,38 @@ impl MigrationContext {
         MigrationContext {
             migration_index,
             action_index,
+            deferred_touches: None,
         }
+    }
+
+    /// A context whose actions leave their backfills to the caller, which collects them
+    /// with `take_deferred_touches`
+    pub fn deferring_touches(migration_index: usize, action_index: usize) -> Self {
+        MigrationContext {
+            migration_index,
+            action_index,
+            deferred_touches: Some(RefCell::new(Vec::new())),
+        }
+    }
+
+    /// Touches every row of `table` so that its triggers fill in new columns, or leaves it to
+    /// the caller if this context defers touches
+    fn touch_rows(&self, db: &mut dyn Conn, table: &str, column: &str) -> anyhow::Result<()> {
+        match &self.deferred_touches {
+            Some(touches) => {
+                touches
+                    .borrow_mut()
+                    .push((table.to_string(), column.to_string()));
+                Ok(())
+            }
+            None => common::batch_touch_rows(db, table, Some(column)),
+        }
+    }
+
+    pub fn take_deferred_touches(self) -> Vec<(String, String)> {
+        self.deferred_touches
+            .map(RefCell::into_inner)
+            .unwrap_or_default()
     }
 
     fn prefix(&self) -> String {
@@ -488,6 +523,12 @@ pub trait Action: Debug {
     ) -> anyhow::Result<Option<Transaction<'a>>>;
     fn update_schema(&self, ctx: &MigrationContext, schema: &mut Schema);
     fn abort(&self, ctx: &MigrationContext, db: &mut dyn Conn) -> anyhow::Result<()>;
+
+    /// Whether the action only touches rows through `MigrationContext::touch_rows`, so that its
+    /// backfill can wait for the actions after it and share one pass over the table
+    fn defers_touches(&self) -> bool {
+        false
+    }
 
     /// User-provided SQL in the action, which is validated before the action runs
     fn sql_fields(&self) -> Vec<SqlField> {

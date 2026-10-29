@@ -147,7 +147,7 @@ impl Action for AddColumn {
                 db.run(&query).context("failed to create up trigger")?;
 
                 // Backfill values in batches
-                common::batch_touch_rows(db, &table.real_name, Some(&temp_column_name))
+                ctx.touch_rows(db, &table.real_name, &temp_column_name)
                     .context("failed to batch update existing rows")?;
             }
 
@@ -414,6 +414,10 @@ impl Action for AddColumn {
         db.run(&query).context("failed to drop up trigger")?;
 
         Ok(())
+    }
+
+    fn defers_touches(&self) -> bool {
+        matches!(self.up, Some(Transformation::Simple(_)))
     }
 
     fn sql_fields(&self) -> Vec<SqlField> {

@@ -1338,3 +1338,94 @@ fn add_column_with_composite_primary_key() {
 
     test.run();
 }
+
+#[test]
+fn add_columns_to_one_table_in_one_pass() {
+    let mut test = Test::new("Add columns to one table in one pass");
+
+    test.first_migration(
+        r#"
+        name = "create_items_table"
+
+        [[actions]]
+        type = "create_table"
+        name = "items"
+        primary_key = ["id"]
+
+            [[actions.columns]]
+            name = "id"
+            type = "INTEGER"
+        "#,
+    );
+
+    test.second_migration(
+        r#"
+        name = "add_multiple_columns"
+
+        [[actions]]
+        type = "add_column"
+        table = "items"
+
+        up = "id * 2"
+
+            [actions.column]
+            name = "doubled"
+            type = "INTEGER"
+            nullable = false
+
+        [[actions]]
+        type = "add_column"
+        table = "items"
+
+        up = "doubled * 2"
+
+            [actions.column]
+            name = "quadrupled"
+            type = "INTEGER"
+            nullable = false
+        "#,
+    );
+
+    test.after_first(|db| {
+        // More rows than one backfill batch holds, and a count of how many times they're updated
+        db.simple_query(
+            "
+            INSERT INTO items (id) SELECT i FROM generate_series(1, 2500) i;
+
+            CREATE TABLE public.updates (count INTEGER NOT NULL);
+            INSERT INTO public.updates VALUES (0);
+
+            CREATE OR REPLACE FUNCTION public.count_update() RETURNS TRIGGER AS $$
+            BEGIN
+                UPDATE public.updates SET count = count + 1;
+                RETURN NEW;
+            END
+            $$ LANGUAGE plpgsql;
+
+            CREATE TRIGGER count_update AFTER UPDATE ON public.items
+            FOR EACH ROW EXECUTE PROCEDURE public.count_update();
+            ",
+        )
+        .unwrap();
+    });
+
+    test.intermediate(|old_db, new_db| {
+        let wrong: i64 = new_db
+            .query_one(
+                "SELECT COUNT(*) FROM items
+                WHERE doubled IS DISTINCT FROM id * 2 OR quadrupled IS DISTINCT FROM id * 4",
+                &[],
+            )
+            .unwrap()
+            .get(0);
+        assert_eq!(0, wrong);
+
+        let updates: i32 = old_db
+            .query_one("SELECT count FROM public.updates", &[])
+            .unwrap()
+            .get(0);
+        assert_eq!(2500, updates);
+    });
+
+    test.run();
+}
