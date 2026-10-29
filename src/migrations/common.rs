@@ -1,5 +1,4 @@
 use anyhow::{anyhow, Context};
-use postgres::types::ToSql;
 use serde::{Deserialize, Serialize};
 
 use crate::{db::Conn, schema::Table};
@@ -104,6 +103,9 @@ impl Check {
     }
 }
 
+/// Updates every row of `table` in batches, setting `column` (or the first primary key column)
+/// to itself so that its triggers fill in new columns. Runs as one statement that commits after
+/// each batch, so it can't be called inside a transaction.
 pub fn batch_touch_rows(
     db: &mut dyn Conn,
     table: &str,
@@ -111,77 +113,80 @@ pub fn batch_touch_rows(
 ) -> anyhow::Result<()> {
     const BATCH_SIZE: u16 = 1000;
 
-    // The last row touched, as JSON of its primary key. A key of several columns has no type a
-    // parameter can carry, so we rebuild the row from JSON instead.
-    let mut cursor: Option<String> = None;
-
     let primary_key = get_primary_key_columns_for_table(db, table)?;
 
     // If no column to touch is passed, we default to the first primary key column (just to make some "update")
     let touched_column = column.unwrap_or(primary_key[0].as_str());
 
-    let primary_key_columns = primary_key.join(", ");
+    let quoted_columns = |prefix: &str, suffix: &str| {
+        primary_key
+            .iter()
+            .map(|column| format!("{prefix}\"{column}\"{suffix}"))
+            .collect::<Vec<String>>()
+            .join(", ")
+    };
+    let primary_key_columns = quoted_columns("", "");
+    let returning_columns = quoted_columns("rows.", "");
+    let descending_columns = quoted_columns("", " DESC");
     let primary_key_where = primary_key_match(table, &primary_key, "rows");
 
-    loop {
-        let mut params: Vec<&(dyn ToSql + Sync)> = Vec::new();
+    // The key of the last row touched
+    let cursor_variables = (0..primary_key.len())
+        .map(|i| format!("__reshape_cursor_{i}"))
+        .collect::<Vec<String>>();
+    let cursor_declarations = primary_key
+        .iter()
+        .zip(&cursor_variables)
+        .map(|(column, variable)| format!("{variable} public.\"{table}\".\"{column}\"%TYPE;"))
+        .collect::<Vec<String>>()
+        .join("\n");
+    let cursor = cursor_variables.join(", ");
 
-        let returning_columns = primary_key
-            .iter()
-            .map(|column| format!("rows.\"{}\"", column))
-            .collect::<Vec<String>>()
-            .join(", ");
-
-        let cursor_where = if let Some(cursor) = &cursor {
-            params.push(cursor);
-
-            format!(
-                r#"
-                WHERE ({primary_key_columns}) > (
-                    SELECT {primary_key_columns}
-                    FROM json_populate_record(NULL::public."{table}", $1::text::json)
-                )
-                "#,
-                primary_key_columns = primary_key_columns,
-                table = table,
-            )
-        } else {
-            "".to_string()
-        };
-
-        let query = format!(
+    let batch = |cursor_where: &str| {
+        format!(
             r#"
             WITH rows AS (
                 SELECT {primary_key_columns}
                 FROM public."{table}"
                 {cursor_where}
                 ORDER BY {primary_key_columns}
-                LIMIT {batch_size}
-            ), update AS (
+                LIMIT {BATCH_SIZE}
+            ), updated AS (
                 UPDATE public."{table}" "{table}"
                 SET "{touched_column}" = "{table}"."{touched_column}"
                 FROM rows
                 WHERE {primary_key_where}
                 RETURNING {returning_columns}
             )
-            SELECT to_json(updated)::text AS last_value
-            FROM update AS updated
-            ORDER BY {primary_key_columns} DESC
-            LIMIT 1
-            "#,
-            batch_size = BATCH_SIZE,
-        );
-        let last_value = db
-            .query_with_params(&query, &params)?
-            .first()
-            .and_then(|row| row.get("last_value"));
+            SELECT {primary_key_columns} INTO {cursor}
+            FROM updated
+            ORDER BY {descending_columns}
+            LIMIT 1;
+            "#
+        )
+    };
 
-        if last_value.is_none() {
-            break;
-        }
-
-        cursor = last_value
-    }
+    // The first batch is written out on its own, rather than as a cursor condition that holds
+    // until the cursor is set, because PL/pgSQL switches to a generic plan after a few batches
+    // and that plan couldn't use the primary key index for an OR.
+    db.run(&format!(
+        r#"
+        DO $$
+        DECLARE
+            {cursor_declarations}
+        BEGIN
+            {first_batch}
+            WHILE FOUND LOOP
+                COMMIT;
+                {next_batch}
+            END LOOP;
+        END
+        $$
+        "#,
+        first_batch = batch(""),
+        next_batch = batch(&format!("WHERE ({primary_key_columns}) > ({cursor})")),
+    ))
+    .context("failed to touch rows")?;
 
     Ok(())
 }
